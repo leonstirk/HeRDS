@@ -1,16 +1,24 @@
 Package: HeRDS
-Title: What the Package Does (One Line, Title Case)
+Title: Hedonic Residual Delta Surface
 Version: 0.0.0.9000
 Authors@R: 
-    person(given = "First",
-           family = "Last",
+    person(given = "Leon",
+           family = "Stirk-Wang",
            role = c("aut", "cre"),
-           email = "first.last@example.com",
-           comment = c(ORCID = "YOUR-ORCID-ID"))
-Description: What the package does (one paragraph).
-License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
-    license
+           email = "leon.stirkwang@protonmail.com")
+Description: Tools to implement the HeRDS method for spatial analysis. An example application is real estate sales data. A hedonic regression is carried out to control for the effect of property level characteristics on the sale price of geolocated properties. The resulting residuals can be plotted in space (and/or interpolated to a raster surface) to show the spatial distribution of unmodelled variation in price. Any two raster surfaces that can be generated using this approach can be differenced to form the delta surface. That is, the surface that captures the changes in the hedonically unmodelled spatial variation in price.
+License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.1.1
+Imports: 
+    dplyr,
+    gstat,
+    magrittr,
+    sf,
+    terra
+Suggests: 
+    rmarkdown,
+    knitr
+VignetteBuilder: knitr

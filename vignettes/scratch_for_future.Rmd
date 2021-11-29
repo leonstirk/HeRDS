@@ -1,0 +1,618 @@
+---
+title: "scratch_for_future"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{scratch_for_future}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(HeRDS)
+```
+
+```{r, eval=FALSE, include=FALSE}
+# And a lot of different packages to test their interpolation functions
+library(gstat)  # inverse distance weighted, Kriging
+library(fields) # Thin Plate Spline
+library(interp) # Triangulation
+library(mgcv)   # Spatial GAM
+library(automap)# Automatic approach to Kriging
+
+# Finally, some packages to make pretty plots
+library(patchwork)
+library(viridis)
+
+## Reference: https://swilke-geoscience.net/post/spatial_interpolation/
+## https://rspatial.org/terra/analysis/4-interpolation.html
+## https://www.introranger.org/post/interpolation-lesson/
+## https://timogrossenbacher.ch/2018/03/categorical-spatial-interpolation-with-r/
+
+####################################################################################################
+
+## Kriging ??
+## bb <- bbox(as(chc_ur, 'Spatial'))
+## grid <- GridTopology(bb[,1], c(100,100), c(310,270))
+## ## gridpoints <- SpatialPoints(grid, proj4string = sp::CRS("+init=epsg:2193"))
+## gridpoints <- SpatialPoints(grid, proj4string = CRS("+proj=tmerc +lat_0=0.0 +lon_0=173.0 +k=0.9996 +x_0=1600000.0 +y_0=10000000.0 +datum=WGS84 +units=m"))
+## cropped_gridpoints <- raster::crop(gridpoints, as(chc_ur, 'Spatial'))
+## spgrid <- SpatialPixels(cropped_gridpoints)
+## plot(spgrid)
+
+## test <- as(b, 'Spatial')
+## test <- spTransform(test, CRS("+proj=tmerc +lat_0=0.0 +lon_0=173.0 +k=0.9996 +x_0=1600000.0 +y_0=10000000.0 +datum=WGS84 +units=m"))
+## tmp <- autoKrige(err~1, test, spgrid)
+
+
+####################################################################################################
+## Descibe
+
+dsp_b$err %>% summary()
+dsp_b$err %>% density() %>% plot()
+rug(dsp_b$err)
+
+dsp_a$err %>% summary()
+dsp_a$err %>% density() %>% plot()
+rug(dsp_a$err)
+
+tmp <- rbind(data.frame(err = dsp_b$err, g = 0), data.frame(err = dsp_a$err, g = 1))
+tmp$g <- as.factor(as.character(tmp$g))
+sm::sm.density.compare(x = tmp$err, group = tmp$g, h = 0.01)
+
+tmp <- tmp %>% filter(err > -1 & err < 1)
+sm::sm.density.compare(x = tmp$err, group = tmp$g, h = 0.01)
+
+
+####################################################################################################
+## NULL model
+
+RMSE <- function(observed, predicted) {
+  sqrt(mean((predicted - observed)^2, na.rm=TRUE))
+}
+
+null <- RMSE(mean(dsp_b$err), dsp_b$err)
+null
+
+####################################################################################################
+## TM <- sp::proj4string(sp::CRS("+init=epsg:2193"))
+## dtm <- terra::project(dsp, TM)
+
+dtm <- dsp_b
+
+v <- terra::voronoi(dtm)
+
+terra::plot(v)
+terra::points(dtm)
+
+chc_mask <- terra::vect(as(chc_ur, 'Spatial'))
+vca <- terra::crop(v, chc_mask)
+
+terra::plot(vca, "err")
+
+
+r <- terra::rast(vca, res = 1000)
+vr <- terra::rasterize(vca, r, "err")
+
+terra::plot(vr)
+
+
+rm(chc_ur, vca, v)
+
+####################################################################################################
+## CV
+
+set.seed(3895476)
+kf <- sample(1:5, nrow(dtm), replace=TRUE)
+rmse <- rep(NA, 5)
+for (k in 1:5) {
+  test <- dtm[kf == k, ]
+  train <- dtm[kf != k, ]
+  v <- terra::voronoi(train)
+  p <- terra::extract(v, test)
+  rmse[k] <- RMSE(test$err, p$err)
+}
+rmse
+
+mean(rmse)
+
+# relative model performance
+perf <- 1 - (mean(rmse) / null)
+round(perf, 3)
+
+####################################################################################################
+## KNN interp
+
+nnMaskRaster <- function(dtm) {
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  gs <- gstat::gstat(formula=err~1, locations=~x+y, data=d, nmax=10, set=list(idp = 0))
+  nn <- terra::interpolate(r, gs, debug.level=0)
+  nnmsk <- terra::mask(nn, vr)
+  return(nnmsk)
+}
+
+delta <- nnMaskRaster(dsp_a) - nnMaskRaster(dsp_b)
+
+terra::plot(delta, 1)
+
+library(tmap)
+tmap_mode('view')
+tm_shape(delta$var1.pred) + tm_raster(alpha = 0.7)
+
+tmp <- nnMaskRaster(dsp_b)
+terra::plot(tmp, 1)
+
+## CV
+dtm <- dsp_b
+## dtm <- dsp_a
+
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+rmsenn <- rep(NA, 5)
+kf <- sample(1:5, nrow(dtm), replace=TRUE)
+for (k in 1:5) {
+  test <- d[kf == k, ]
+  train <- d[kf != k, ]
+  gscv <- gstat::gstat(formula=err~1, locations=~x+y, data=train, nmax=5, set=list(idp = 0))
+  p <- predict(gscv, test, debug.level=0)$var1.pred
+  rmsenn[k] <- RMSE(test$err, p)
+}
+rmsenn
+mean(rmsenn)
+perf <- 1 - (mean(rmsenn) / null)
+round(perf, 3)
+
+####################################################################################################
+
+idwMaskRaster <- function(dtm) {
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  gs <- gstat::gstat(formula=err~1, locations=~x+y, data=d, nmax=100, set=list(idp=1))
+  idw <- terra::interpolate(r, gs, debug.level=0)
+  idwr <- terra::mask(idw, vr)
+  return(idwr)
+}
+ 
+delta <- idwMaskRaster(dsp_a) - idwMaskRaster(dsp_b)
+
+terra::plot(delta, 1)
+
+tmap_mode('view')
+tm_shape(as(dsp_b, 'Spatial')) + tm_dots(col = 'blue') +
+tm_shape(as(dsp_a, 'Spatial')) + tm_dots(col = 'red') 
+
+tm_shape(delta$var1.pred) + tm_raster(alpha = 0.8)
+
+tmp <- idwMaskRaster(dsp_b)
+terra::plot(tmp, 1)
+
+tmp <- idwMaskRaster(dsp_a)
+terra::plot(tmp, 1)
+
+
+## CV
+dtm <- dsp_b
+## dtm <- dsp_a
+
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+rmseidw <- rep(NA, 5)
+kf <- sample(1:5, nrow(dtm), replace=TRUE)
+for (k in 1:5) {
+  test <- d[kf == k, ]
+  train <- d[kf != k, ]
+  gscv <- gstat::gstat(formula=err~1, locations=~x+y, data=train, nmax=100, set=list(idp = 1))
+  p <- predict(gscv, test, debug.level=0)$var1.pred
+  rmseidw[k] <- RMSE(test$err, p)
+}
+rmseidw
+mean(rmseidw)
+perf <- 1 - (mean(rmseidw) / null)
+round(perf, 3)
+
+####################################################################################################
+
+gamMaskRaster <- function(dtm) {
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  fit_gam <- mgcv::gam(err ~ s(x, y), data = d)
+  gam <- terra::interpolate(r, fit_gam, debug.level=0)
+  gamr <- terra::mask(gam, vr)
+  return(gamr)
+}
+
+delta <- gamMaskRaster(dsp_a) - gamMaskRaster(dsp_b)
+terra::plot(delta, 1)
+
+tmap_mode('view')
+tm_shape(as(dsp_b, 'Spatial')) + tm_dots(col = 'blue') +
+  tm_shape(as(dsp_a, 'Spatial')) + tm_dots(col = 'red') + 
+  tm_shape(delta$lyr.1) + tm_raster(alpha = 0.8)
+  
+
+tmp <- gamMaskRaster(dsp_b)
+terra::plot(tmp, 1)
+
+
+## CV
+dtm <- dsp_b
+## dtm <- dsp_a
+
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+rmsegam <- rep(NA, 5)
+kf <- sample(1:5, nrow(dtm), replace=TRUE)
+for (k in 1:5) {
+  test <- d[kf == k, ]
+  train <- d[kf != k, ]
+  gscv <- gstat::gstat(formula=err~1, locations=~x+y, data=train, nmax=100, set=list(idp = 1))
+  p <- predict(gscv, test, debug.level=0)$var1.pred
+  rmsegam[k] <- RMSE(test$err, p)
+}
+rmsegam
+mean(rmsegam)
+perf <- 1 - (mean(rmsegam) / null)
+round(perf, 3)
+####################################################################################################
+
+tpsMaskRaster <- function(dtm, f) {
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  d <- d %>% sample_frac(f)
+  fit_tps <- fields::Tps(x = as.matrix(d[, c("x", "y")]), Y = d$err, miles = FALSE)
+  tps <- terra::interpolate(r, fit_tps, debug.level=0)
+  tpsr <- terra::mask(tps, vr)
+  return(tpsr)
+}
+
+tmp_a <- tpsMaskRaster(dsp_a, 0.3)
+tmp_b <- tpsMaskRaster(dsp_b, 0.3)
+delta <- tmp_a - tmp_b
+
+terra::plot(delta, 1)
+terra::points(dsp_b, col = 2, cex = 0.01)
+terra::points(dsp_a, col = 4, cex = 0.01)
+
+####################################################################################################
+
+krigMaskRaster <- function(dtm){
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  fit_KRIG <- automap::autoKrige(      # using {automap}
+    formula = err ~ 1,                 # The interface is similar to {gstat} but
+    input_data = as(dtm, "Spatial") # {automap} makes a lot of assumptions for you
+  ) %>% 
+    .$krige_output %>%  # the function returns a complex object with lot's of metainfo
+    as.data.frame() %>% # we keep only the data we are interested in
+    dplyr::select(X = x1, Y = x2, Z = var1.pred) 
+}
+
+####################################################################################################
+
+tinMaskRaster <- function(dtm) {
+  d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+  fit_TIN <- interp::interp( # using {interp}
+    x = d$x,           # the function actually accepts coordinate vectors
+    y = d$y,
+    z = d$err,
+    xo = grd_template$X,     # here we already define the target grid
+    yo = grd_template$Y,
+    output = "points"
+  ) %>% bind_cols()
+}
+
+####################################################################################################
+
+dtm <- dsp_b
+
+d <- data.frame(terra::geom(dtm)[, c("x", "y")], terra::as.data.frame(dtm))
+gs <- gstat::gstat(formula=err~1, locations=~x+y, data=d)
+v <- gstat::variogram(gs, width = 20)
+v
+plot(v)
+
+fve <- gstat::fit.variogram(v, gstat::vgm(0.031, 'Exp', 1400, 0.018))
+fve
+
+plot(gstat::variogramLine(fve, 10000), type='l')
+points(v[,2:3], pch=20, col='red')
+
+plot(v, fve)
+
+k <- gstat::gstat(formula=err~1, locations=~x+y, data=sample_frac(d, 0.03), model=fve)
+start <- Sys.time()
+kp <- terra::interpolate(r, k, debug.level=0)
+print(Sys.time() - start)
+
+ok <- terra::mask(kp, vr)
+names(ok) <- c('prediction', 'variance')
+terra::plot(ok)
+
+####################################################################################################
+
+
+
+
+plot_my_rasters <- function(raster_object, raster_name){
+  
+  df <- rasterToPoints(raster_object) %>% as_tibble()
+  colnames(df) <- c("X", "Y", "Z")
+  
+  ggplot(df, aes(x = X, y = Y, fill = Z)) +
+    geom_raster() +
+    ggtitle(label = raster_name) +
+    scale_fill_viridis(option = "C") +
+    theme_bw() +
+    theme(
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank()
+    )
+}
+
+rasterlist <- list(
+  "Nearest Neighbor" = interp_NN, 
+  "Inverse Distance Weighted" = interp_IDW, 
+  "Kriging" = interp_KRIG, 
+  "Thin Plate Spline Regression" = interp_TPS,
+  "Triangular Irregular Surface" = interp_TIN, 
+  "Generalized Additive Model" = interp_GAM
+)
+
+plotlist <- map2(
+  rasterlist,
+  names(rasterlist),
+  plot_my_rasters
+)
+
+# Note that the next trick only works because of library(patchwork)
+(plotlist[[1]] + plotlist[[2]]) /
+  (plotlist[[3]] + plotlist[[4]]) /
+  (plotlist[[5]] + plotlist[[6]])
+
+
+
+####################################################################################################
+
+# specify grid width in pixels
+width_in_pixels <- 300
+# dx is the width of a grid cell in meters
+dx <- ceiling( (st_bbox(chc_ur)["xmax"] - 
+                  st_bbox(chc_ur)["xmin"]) / width_in_pixels)
+# dy is the height of a grid cell in meters
+# because we use quadratic grid cells, dx == dy
+dy <- dx
+# calculate the height in pixels of the resulting grid
+height_in_pixels <- floor( (st_bbox(chc_ur)["ymax"] - 
+                              st_bbox(chc_ur)["ymin"]) / dy)
+
+grid <- st_make_grid(chc_ur, 
+                     cellsize = dx,
+                     n = c(width_in_pixels, height_in_pixels),
+                     what = "centers"
+)
+
+rm(dx, dy, height_in_pixels, chc_ur)
+
+plot(grid)
+
+train <- data.frame(err = b$err, 
+                    lon = st_coordinates(b)[, 1], 
+                    lat = st_coordinates(b)[, 2])
+
+
+
+k <- 100 # "k" for k-nearest-neighbour-interpolation
+
+# specify function which is executed for each tile of the grid
+computeGrid <- function(grid, train, knn) {
+  # create empty result data frame
+  dialects_result <- data.frame(dialect = as.factor(NA), 
+                                lon = st_coordinates(grid)[, 1], 
+                                lat = st_coordinates(grid)[, 2])
+  # run KKNN
+  dialects_kknn <- kknn::kknn(err ~ ., 
+                              train = train, 
+                              test = dialects_result, 
+                              kernel = "gaussian", 
+                              k = k)
+  # bring back to result data frame
+  # only retain the probability of the dominant dialect at that grid cell
+  dialects_result %<>%
+    # extract the interpolated dialect at each grid cell with the 
+    # kknn::fitted function
+    mutate(dialect = fitted(dialects_kknn) #,
+           # only retain the probability of the interpolated dialect, discard the other 7
+           # prob = apply(dialects_kknn$prob, 1, function(x) max(x))
+           )
+  return(dialects_result)
+}
+
+
+b_raster <- computeGrid(grid, train, k)
+ggplot(data = b_raster) +
+  geom_raster(aes(x = lon, y = lat, fill = dialect)) + 
+  scale_fill_viridis()
+
+b_raster <- st_as_sf(x = b_raster, coords = c('lon', 'lat'), crs = 2193)
+
+chc_ur <- readRDS('datasets/chc_ur_2018_poly.rds')
+chc_ur <- chc_ur[which(chc_ur$UR2018_V1_00_NAME == 'Christchurch'),]
+chc_ur <- st_transform(chc_ur, crs = 2193)
+chc_ur <- st_cast(chc_ur, 'GEOMETRYCOLLECTION') %>% st_collection_extract("POLYGON")
+
+b_raster <- b_raster[chc_ur,]
+
+b_raster <- stars::st_rasterize(b_raster)
+
+ggplot() +
+  stars:geom_stars(data = b_raster) + 
+  scale_fill_viridis()
+
+####################################################################################################
+
+## Optimised IDW
+f1 <- function(x, test, train) {
+  nmx <- x[1]
+  idp <- x[2]
+  if (nmx < 1) return(Inf)
+  if (idp < .001) return(Inf)
+  m <- gstat(formula=OZDLYAV~1, locations=~x+y, data=train, nmax=nmx, set=list(idp=idp))
+  p <- predict(m, newdata=test, debug.level=0)$var1.pred
+  RMSE(test$OZDLYAV, p)
+}
+set.seed(20150518)
+i <- sample(nrow(aq), 0.2 * nrow(aq))
+tst <- p[i,]
+trn <- p[-i,]
+opt <- optim(c(8, .5), f1, test=tst, train=trn)
+str(opt)
+
+
+m <- gstat(formula=OZDLYAV~1, locations=~x+y, data=p, nmax=opt$par[1], set=list(idp=opt$par[2]))
+idw <- interpolate(r, m, debug.level=0)
+idw <- mask(idw, ca)
+plot(idw, 1)
+
+####################################################################################################
+## Ensembling
+nullrmse <- RMSE(test$OZDLYAV, mean(test$OZDLYAV))
+w <- nullrmse - rms
+# normalize weights to sum to 1
+weights <- ( w / sum(w) )
+# check
+sum(weights)
+## [1] 1
+s <- c(idw[[1]], ok[[1]], tps)
+ensemble <- sum(s * weights)
+
+####################################################################################################
+## Data support measure
+## https://rspatial.org/terra/analysis/8-pointpat.html
+
+## basic
+xy <- crds(dsp_b)
+paste(round(nrow(xy)/(as.numeric(sf::st_area(st_as_sf(chc_mask)))/10000),3), 'sales/hectare') ## density in hectares
+
+## density raster
+nc <- terra::rasterize(dsp_b, r, fun = function(i){length(i)})
+nc <- terra::mask(nc, vr)
+terra::plot(nc)
+terra::plot(as(chc_ur,'Spatial'), add=TRUE)
+
+tmp <- dsp_b[1:1000]
+## isolated points
+xy <- terra::crds(tmp)
+dd <- terra::distance(tmp)
+dm <- as.matrix(dd)
+diag(dm) <- NA
+## this is quite crude
+dmin <- apply(dm, 1, min, na.rm=TRUE)
+## this is more sophisticated
+dmin <- apply(dm, 1, function(i) { mean(head(sort(i), 50)) })
+mdmin <- mean(dmin)
+wdmin <- apply(dm, 1, which.min)
+
+## This is quite good as a distance based measure
+tmp$dist <- 1/log(dmin)
+nc <- terra::rasterize(tmp, r, 'dist')
+nc <- terra::mask(nc, vr)
+terra::plot(nc)
+terra::plot(as(chc_ur,'Spatial'), add=TRUE)
+
+
+terra::plot(vr)
+terra::points(tmp, cex=.1)
+ord <- rev(order(dmin))
+far25 <- ord[1:25]
+neighbors <- wdmin[far25]
+points(xy[far25, ], col='blue', pch=20)
+points(xy[neighbors, ], col='red')
+# drawing the lines, easiest via a loop
+for (i in far25) {
+  lines(rbind(xy[i, ], xy[wdmin[i], ]), col='red')
+}
+
+## G-function
+max(dmin)
+# get the unique distances (for the x-axis)
+dist <- sort(unique(round(dmin)))
+# compute how many cases there with distances smaller that each x
+Gd <- sapply(dist, function(x) sum(dmin < x))
+# normalize to get values between 0 and 1
+Gd <- Gd / length(dmin)
+
+stepplot <- function(x, y, type='l', add=FALSE, ...) {
+  x <- as.vector(t(cbind(x, c(x[-1], x[length(x)]))))
+  y <- as.vector(t(cbind(y, y)))
+  if (add) {
+    lines(x,y, ...)
+  } else {
+    plot(x,y, type=type, ...)
+  }
+}
+
+stepplot(dist, Gd, type='l', lwd=2)
+
+## F-function
+## must have reduced raster resolution for the following
+p <- terra::as.points(vr)
+# compute distance from all crime sites to these cell centers
+d2 <- terra::distance(p, dsp_b[1:1000])
+d2 <- as.matrix(d2)
+# the remainder is similar to the G function
+Fdistance <- sort(unique(round(d2)))
+mind <- apply(d2, 1, min)
+Fd <- sapply(Fdistance, function(x) sum(mind < x))
+Fd <- Fd / length(mind)
+plot(Fdistance, Fd, type='l', lwd=2, xlim=c(0,3000))
+
+## Expected F-dist
+ef <- function(d, lambda) {
+  E <- 1 - exp(-1 * lambda * pi * d^2)
+}
+expected <- ef(0:1000, dens)
+
+## Plot
+plot(distance, Gd, type='l', lwd=2, col='red', las=1,
+     ylab='F(d) or G(d)', xlab='Distance', yaxs="i", xaxs="i", ylim=c(0,1.1))
+lines(Fdistance, Fd, lwd=2, col='blue')
+lines(0:2000, expected, lwd=2)
+legend(1200, .3,
+       c(expression(italic("G")["d"]), expression(italic("F")["d"]), 'expected'),
+       lty=1, col=c('red', 'blue', 'black'), lwd=2, bty="n")
+
+
+## K function
+distance <- seq(1, 30000, 100)
+Kd <- sapply(distance, function(x) sum(d < x)) # takes a while
+Kd <- Kd / (length(Kd) * dens)
+plot(distance, Kd, type='l', lwd=2)
+
+####################################################################################################
+## Density/Support measures using spatstat
+## This isn't so hot
+
+library(spatstat)
+
+chcOwin <- as.owin(chc_ur)
+chcOwin
+
+pts <- terra::crds(dsp_b)
+head(pts)
+
+p <- ppp(pts[,1], pts[,2], window=chcOwin)
+class(p)
+p
+plot(p)
+
+ds <- terra::density(p)
+class(ds)
+plot(ds, main='data support')
+
+####################################################################################################
+
+## Auto krige with sp
+## Have to do this manually?
+
+
+```

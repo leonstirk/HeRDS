@@ -1,0 +1,328 @@
+---
+title: "HeRDS_vignette"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{HeRDS_vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(HeRDS)
+```
+
+And a lot of different packages to test their interpolation functions:
+library(gstat)  # inverse distance weighted, Kriging
+library(fields) # Thin Plate Spline
+library(interp) # Triangulation
+library(mgcv)   # Spatial GAM
+library(automap)# Automatic approach to Kriging
+
+
+Some inputs to this package:
+Reference: https://swilke-geoscience.net/post/spatial_interpolation/
+https://rspatial.org/terra/analysis/4-interpolation.html
+https://www.introranger.org/post/interpolation-lesson/
+https://timogrossenbacher.ch/2018/03/categorical-spatial-interpolation-with-r/
+
+```{r, eval=FALSE, include=FALSE}
+library(tidyverse)
+library(sf)
+library(terra)
+library(tmap)
+library(viridis)
+
+####################################################################################################
+## Cropping polygon layer
+buffer_dist <- 0
+chc_ur <- readRDS('../../../diss/datasets/chc_ur_2018_poly.rds')
+chc_ur <- chc_ur[which(chc_ur$UR2018_V1_00_NAME == 'Christchurch'),]
+chc_ur <- st_transform(chc_ur, crs = 2193)
+chc_ur <- st_cast(chc_ur, 'GEOMETRYCOLLECTION') %>% st_collection_extract("POLYGON")
+chc_ur <- chc_ur %>% st_buffer(dist = buffer_dist) # in meters
+
+
+####################################################################################################
+## Point layers
+cas <- readRDS('../../../diss/datasets/chc_allsales_augmented.rds')
+
+dat <- cas %>% filter(!is.na(median_income), !is.na(hh_rent_rate))
+dat <- dat[names(dat)[!names(dat) %in% unlist(lapply(dat, anyNA))]]
+
+dat_sf <-  st_as_sf(x = as.data.frame(dat), coords = c('lon', 'lat'), crs = 4326)
+dat_sf  <- dat_sf %>% st_transform(crs = 2193)
+dat_sf <- dat_sf[chc_ur,]
+
+chc_event_dates <- c('q1' = as.Date('2010-09-04'), 'q2' = as.Date('2011-02-22'), 'tc' = as.Date('2011-11-16'))
+c <- dat_sf %>% select(ln_sale_price)
+
+## Before q1, after q2
+b <- dat_sf %>% filter(sale_date < chc_event_dates[1])
+a <- dat_sf %>% filter(sale_date > chc_event_dates[2])
+
+####################################################################################################
+## After q2 2 years, 2 years to end
+window_size_y <- 2
+e <- dat_sf$sale_date %>% max
+emw <- e - (window_size_y*365)
+
+q2 <- chc_event_dates[2]
+q2pw <- q2 + (window_size_y*365)
+
+q2 <- chc_event_dates[2] + 365
+q2pw <- q2 + (window_size_y*365)
+
+## check no overlap
+emw > q2pw ## should evaluate TRUE
+
+b <- dat_sf %>% filter(sale_date < q2pw & sale_date > q2)
+a <- dat_sf %>% filter(sale_date < e & sale_date > emw )
+
+rm(window_size_y, e, emw, q2, q2pw)
+####################################################################################################
+
+## Residuals
+
+model <- as.formula(ln_sale_price 
+  ~ poly(building_floor_area, 2, raw = T) 
+  + poly(land_area, 2, raw = T)
+  + decade_built
+  + bedrooms
+  + bathrooms
+  + view_type*view_scope
+  + carparks
+  ## + dist_cbd
+  ## + median_income
+  ## + hh_rent_rate
+  ## + zone_description
+  ## + technical_category
+  + sale_year)
+
+b <- b %>% HeRDS::genResiduals(model)
+a <- a %>% HeRDS::genResiduals(model)
+
+b <- data.frame(err = b$err, lon = st_coordinates(b)[,1], lat = st_coordinates(b)[,2])
+a <- data.frame(err = a$err, lon = st_coordinates(a)[,1], lat = st_coordinates(a)[,2])
+c <- data.frame(price = c$ln_sale_price, lon = st_coordinates(c)[,1], lat = st_coordinates(c)[,2])
+
+dsp_b <- terra::vect(b, c('lon', 'lat'), crs = st_crs(2193))
+dsp_a <- terra::vect(a, c('lon', 'lat'), crs = st_crs(2193))
+dsp_c <- terra::vect(c, c('lon', 'lat'), crs = st_crs(2193))
+
+# rm(cas, dat, dat_sf, chc_event_dates, model)
+
+####################################################################################################
+#Raster layer
+res <- 300
+
+chc_mask <- terra::vect(as(chc_ur, 'Spatial'))
+r <- terra::rast(chc_mask, res = res)
+
+rm(chc_ur)
+
+####################################################################################################
+## Descibe
+
+####################################################################################################
+## Make a map
+
+tmap_mode('view')
+tm_shape(st_as_sf(a, coords = c('lon', 'lat'), crs = 2193)) + tm_dots(col = 'red') + 
+  tm_shape(st_as_sf(b, coords = c('lon', 'lat'), crs = 2193)) + tm_dots(col = 'blue')
+
+ggplot() + 
+  geom_point(data = a, aes(x = lon, y = lat), col = 'red', size = 0.1) + 
+  geom_point(data = b, aes(x = lon, y = lat), col = 'blue', size = 0.1) + coord_equal()
+
+####################################################################################################
+## NULL model
+
+RMSE <- function(observed, predicted) {
+  sqrt(mean((predicted - observed)^2, na.rm=TRUE))
+}
+
+null <- RMSE(mean(dsp_b$err), dsp_b$err)
+null
+
+####################################################################################################
+## KNN interp
+
+model <- as.formula(err~1)
+
+b_rast <- HeRDS::nnRaster(dsp_b, model = model, raster = r, mask_layer = chc_mask, nmax = 100, idp = 1)
+a_rast <- HeRDS::nnRaster(dsp_a, model = model, raster = r, mask_layer = chc_mask, nmax = 100, idp = 1)
+
+delta <- HeRDS::nnGetDelta(dsp_b, dsp_a, model = model, raster = r, mask_layer = chc_mask, nmax = 100, idp = 1)
+terra::plot(delta, 1)
+
+####################################################################################################
+## CV the KNN against NULL spatial model
+dtm <- dsp_b
+
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+rmsenn <- rep(NA, 5)
+set.seed(3895476)
+kf <- sample(1:5, nrow(dtm), replace=TRUE)
+for (k in 1:5) {
+  test <- d[kf == k, ]
+  train <- d[kf != k, ]
+  gscv <- gstat::gstat(formula=err~1, locations=~x+y, data=train, nmax=5, set=list(idp = 0))
+  p <- predict(gscv, test, debug.level=0)$var1.pred
+  rmsenn[k] <- RMSE(test$err, p)
+}
+rmsenn
+mean(rmsenn)
+perf <- 1 - (mean(rmsenn) / null)
+round(perf, 3)
+rm(test, train, gscv, p, rmsenn, perf)
+
+####################################################################################################
+## Data support measure
+## https://rspatial.org/terra/analysis/8-pointpat.html
+
+support <- HeRDS::dataSupportRaster(dsp_b, r, chc_mask)
+plot(log(support))
+plot(chc_mask, add = TRUE)
+
+####################################################################################################
+## Visualise
+
+## ggplot2 for raster color values and alpha combined
+
+support_df <- as.data.frame(stars::st_as_stars(support$dens), xy = TRUE)
+delta_df <- as.data.frame(stars::st_as_stars(delta$err), xy = TRUE)
+
+merged <- merge(support_df, delta_df)
+
+ggplot(data = na.omit(merged)) +
+  geom_tile(aes(x = x, y = y, fill = err, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+## This is effectively the same as the encoding that follows
+ggplot(data = na.omit(merged)) +
+  geom_tile(aes(x = x, y = y, fill = err, alpha = log(dens))) +
+  scale_fill_viridis(limits = c(-0.2, 0.2), oob = scales::squish) + coord_equal()
+
+
+endcode <- function(vec, threshold) {
+  vec[which(vec > threshold)] <- threshold
+  vec[which(vec < threshold*-1)] <- threshold*-1
+  return(vec)
+}
+
+merged$end <- endcode(merged$err, 0.2)
+ggplot(data = na.omit(merged)) +
+  geom_tile(aes(x = x, y = y, fill = end, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+####################################################################################################
+
+rast_list  <- list(
+  "b" = b_rast,
+  "a" = a_rast
+)
+
+plotRasters <- function(rast, support_df) {
+  names(rast)[1] <- 'err'
+  tmp <- merge(support_df, as.data.frame(stars::st_as_stars(rast$err), xy = TRUE))
+  
+  ggplot(data = na.omit(tmp)) + 
+    geom_tile(aes(x = x, y = y, fill = err, alpha = log(dens))) + 
+    scale_fill_viridis(limits = c(-0.2, 0.2), oob = scales::squish) + coord_equal()
+}
+
+
+plot_list <- lapply(rast_list, function(x) { plotRasters(x, support_df) })
+library(patchwork)
+(plot_list[[1]])/(plot_list[[2]])
+
+####################################################################################################
+
+ggplot(data = na.omit(merged)) +
+  geom_point(data = a, aes(x = lon, y = lat), size = 0.1, col = 'red') +
+  geom_point(data = b, aes(x = lon, y = lat), size = 0.1, col = 'blue') +
+  ## geom_point(data = c, aes(x = lon, y = lat), size = 0.1) +
+  geom_tile(aes(x = x, y = y, fill = end, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+hollow <- function(vec, threshold) {
+  vec[which(vec < threshold & vec > threshold*-1)] <- NA
+  return(vec)
+}
+
+merged$hol <- hollow(merged$err, 0.05)
+ggplot(data = na.omit(merged)) +
+  geom_tile(aes(x = x, y = y, fill = hol, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+merged$hol <- hollow(merged$end, 0.05)
+ggplot(data = na.omit(merged)) +
+  geom_tile(aes(x = x, y = y, fill = hol, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+ggplot(data = na.omit(merged)) +
+  geom_point(data = a, aes(x = lon, y = lat), size = 0.1, col = 'red') +
+  geom_point(data = b, aes(x = lon, y = lat), size = 0.1, col = 'blue') +
+  ## geom_point(data = c, aes(x = lon, y = lat), size = 0.1) +
+  geom_tile(aes(x = x, y = y, fill = end, alpha = log(dens))) +
+  scale_fill_viridis() + coord_equal()
+
+
+####################################################################################################
+## Check big residuals
+tmp <- b[b$err %>% order(decreasing = F) %>% head(50),] %>% st_as_sf(coords = c('lon', 'lat'), crs = 2193)
+tmap_mode('view')
+tm_shape(tmp) + tm_dots(col = 'err')
+
+merged_sf <- st_as_sf(merged, coords = c('x', 'y'), crs = 2193)
+tmap_mode('view')
+tm_shape(merged_sf) + tm_dots(col = 'err')
+####################################################################################################
+## Project spatial model onto the after points directly (i.e. no interpolation)
+
+dtm <- dsp_b
+model <- as.formula(err~1)
+nmax <- 100
+idp <- 1
+
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+gs <- gstat::gstat(formula=model, locations=~x+y, data=d, nmax=nmax, set=list(idp = idp))
+
+dtm <- dsp_a
+d <- data.frame(terra::geom(dtm)[,c("x", "y")], terra::as.data.frame(dtm))
+
+preds <- terra::predict(gs, d)
+
+delta <- cbind(d, preds) %>% 
+  select(err, var1.pred, lon, lat) %>% 
+  rename(pred = var1.pred) %>% 
+  select(err, pred, lon, lat) %>% 
+  mutate(delta = err - pred)
+
+ggplot() + 
+  geom_point(data = delta, aes(x = lon, y = lat, col = delta), size = 0.2) + 
+  scale_color_viridis(limits = c(-0.3, 0.3), oob = scales::squish) + 
+  coord_equal()
+
+tmp <- readRDS('../../../diss/datasets/chc_technical_classes_poly.rds')
+tmp <- st_cast(tmp, 'POLYGON')
+tmp <- st_make_valid(tmp)
+tmp <- st_transform(tmp, crs = 2193)
+tmp <- st_intersection(tmp, chc_ur)
+
+ggplot() + 
+  geom_point(data = delta, aes(x = lon, y = lat, col = delta), size = 0.2) + 
+  scale_color_viridis(limits = c(-0.3, 0.3), oob = scales::squish) + 
+  ggnewscale::new_scale_color() + 
+  geom_sf(data = tmp, aes(color = DBH_TC), alpha = 0) +
+  scale_color_discrete()
+```
+
+
